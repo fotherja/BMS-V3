@@ -23,6 +23,10 @@
 #define CCL_SLEW_mA_per_s 10000 // how fast CCL is allowed to change
 #define CVL_SLEW_mV_per_s 100   // how fast CVL is allowed to change
 
+#define T_BLOCK_CHARGE_C  0     // Stop charging below this temperature
+#define T_CCL_CLAMP_C     5     // Reduce charging current below this temperature
+#define CCL_COLD_CAP_mA   15000 // Below T_CCL_CLAMP_C reduce charging current to this
+
 // Proportional trim on CVL when soft-high is exceeded.
 // Each extra mV above V_SOFT_HIGH reduces per-cell CVL by this many mV.
 #define CVL_Kp_pc        2      // e.g. 2 mV PC trim per 1 mV over soft-high
@@ -37,6 +41,7 @@ struct Telemetry {
   uint16_t maxCell_mV;
   uint16_t minCell_mV;
   uint32_t pack_mV;   
+  float pack_temp;
 };
 
 struct Limits {

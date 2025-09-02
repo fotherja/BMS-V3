@@ -21,7 +21,8 @@ enum LedMode : uint8_t {
   LED_BLINK_FAST,   // ~5 Hz
   LED_BLINK_BALANCE, // e.g., 4 Hz while balancing
   LED_BLINK_COV,
-  LED_BLINK_CUV
+  LED_BLINK_CUV,
+  LED_BLINK_ALIVE
 };
 
 struct LedState {

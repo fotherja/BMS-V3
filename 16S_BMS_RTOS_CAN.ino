@@ -9,13 +9,13 @@
 * 
 *
 * To Do:
-*   - Ramp down allowed charging current if temperature drops
-*   - Do CAN init in the CAN thread
-*   - Check pin state initialisations, and do these in threads
-*   - Fault catching, error checks, 
+*   - Rx Current rather than balancing permission and copy this to currentact
+*   - Fault catching, error checks
 *   - ODP programme chip
-*   - Watchdog
-*   - Try serial using the optocouplers
+*
+*
+* Future:
+*   - Try serial using the optocouplers - 2400baud works well - Idea for this would be to have a mode which cancels the 2-signal BMS and instead uses a port to TX cell data to the next BMS
 *  
 */
 #include <BQ76952.h>
@@ -29,6 +29,7 @@
 #include <freertos/event_groups.h>
 #include <freertos/queue.h>
 #include "DVCC.h"
+#include <esp_task_wdt.h>
 
 //--------------------------------------------------
 #define TWAI_DATA_LENGTH_CODE_MAX   8
@@ -45,33 +46,30 @@
 #define CAN_STB             19
 #define CAN_EN              2
 
-
 #define BUTTON_LOW_PIN      9
 #define I2C_SDA_PIN         8
 #define I2C_SCL_PIN         9                                       // Pulling to ground and reseting device enters BOOT mode
 #define BOOT_BTN_PIN        I2C_SCL_PIN
 
-#define AUX_1_PIN           10                                      // Use Aux 1 to disable the Multiplus II GX inverter
-#define AUX_2_PIN           11  //12
-#define AUX_3_PIN           13  //11                                // Use Aux 3 to disable the SmartSolar MPPT charger
-#define AUX_4_PIN           12
+#define AUX_1_PIN           10                                      // ESP - TX1 
+#define AUX_2_PIN           11  //12                                // ESP - RX1
+#define AUX_3_PIN           13  //11                                // ESP - TX2
+#define AUX_4_PIN           12                                      // ESP - TX2
 
 #define UART_TX             16
 #define UART_RX             17
 
-
-#define Cell_Open_Wire_Check_Time     0x9314
+#define CUOV_LATCH_TIME      60000
 //------------- Variables --------------------
 // Your credentials
 // const char*               ssid = "venus-HQ2306ZHQGJ-f3b";         
 // const char*               password = "zz6tzefc";                 
 // const char*               mqtt_server = "192.168.188.122";
 
-
-
 BQ76952                   bms;
 WiFiClient                espClient;
 PubSubClient              client(espClient);
+HardwareSerial            HWSerial(1);                               // use UART1
 
 EventGroupHandle_t        eg;
 constexpr EventBits_t     BALANCING_BIT = BIT0;
@@ -80,7 +78,7 @@ constexpr EventBits_t     CUV_BIT       = BIT5;
 
 QueueHandle_t             logQ;
 
-LedState                  ledG{LED_GREEN_PIN, LED_BLINK_SLOW, false, 0, 100, 900}; // 100ms ON, 900ms OFF
+LedState                  ledG{LED_GREEN_PIN, LED_BLINK_SLOW, false, 0, 100, 900};
 LedState                  ledR{LED_RED_PIN,   LED_OFF,        false, 0, 0,   0};
 
 uint16_t                  Cell_Voltages[NUM_OF_CELLS];
@@ -92,10 +90,9 @@ uint32_t                  StackVoltage_mV = 51200;
 uint16_t                  CVL_Vx10, CCL_Ax10, DCL_Ax10;
 Limits                    lim;
 
-float                     AvgTemperature = 20.5;
+float                     PackTemperature = 20.5;
 uint16_t                  currentact = 0;
-uint16_t                  SOH = 100;             
-uint16_t                  SOC = 80;
+uint16_t                  SOH = 100, SOC = 80;
 
 // ####################################################################################################################
 // --------------------------------------------------------------------------------------------------------------------
@@ -106,18 +103,6 @@ void setup() {
   bms.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   bms.reset();
   delay(100); 
-
-  // Configure pins
-  pinMode(LED_GREEN_PIN, OUTPUT); digitalWrite(LED_GREEN_PIN, HIGH); 
-  pinMode(LED_RED_PIN, OUTPUT); digitalWrite(LED_RED_PIN, HIGH);
-
-  pinMode(AUX_1_PIN, OUTPUT); digitalWrite(AUX_1_PIN, LOW);
-  pinMode(AUX_2_PIN, OUTPUT); digitalWrite(AUX_2_PIN, LOW);
-  pinMode(AUX_3_PIN, OUTPUT); digitalWrite(AUX_3_PIN, LOW);  
-  pinMode(AUX_4_PIN, OUTPUT); digitalWrite(AUX_4_PIN, LOW); 
-
-  // digitalWrite(CAN_EN, HIGH); pinMode(CAN_EN, OUTPUT);              // This enables the CAN DC-DC converter
-  digitalWrite(CAN_STB, LOW); pinMode(CAN_STB, OUTPUT);             // This takes the chip out of standby mode
 
   // Configure the BQ76952:
   bms.setConnectedCells(NUM_OF_CELLS);  
@@ -135,43 +120,13 @@ void setup() {
   bms.writeByteToMemory(DA_Configuration, 0b00001101);              // Set chip die to be for cell temp measurment
   bms.writeByteToMemory(Cell_Open_Wire_Check_Time, 250);            // Set to 250 seconds to reduce unbalanced cell currents  
 
-  bms.writeByteToMemory(TS1_Config, 0b00000000);                    // Configures TS1 not to be used (By default it's used as a cell temp input)
+  bms.writeByteToMemory(TS1_Config, 0b00001011);                    // Configures TS1 as thermistor temperature measurement, reported but not used for protections
   bms.writeByteToMemory(Balancing_Configuration, 0b00000011);       // Enables autonomous balancing
   bms.writeIntToMemory(Power_Config, 0b0010100010110010);           // Disables SLEEP, slow measurement speed when balancing to 1/8th
 
   bms.writeByteToMemory(FET_Options, 0b00000000);                   // FETs will not be turned on
   bms.writeByteToMemory(Chg_Pump_Control, 0b00000000);              // Disable charge pump as not needed
   bms.writeIntToMemory(Mfg_Status_Init, 0x0000);                    // The BQ doesn't control any FETs.
-
-  // Initialize CAN configuration structures using macro initializers
-  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX, (gpio_num_t)CAN_RX, TWAI_MODE_NO_ACK);  // TWAI_MODE_NO_ACK   TWAI_MODE_NORMAL
-  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS(); 
-  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-
-  // Install TWAI driver 
-  if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
-    Serial.println("Driver installed");
-  } else {
-    Serial.println("Failed to install driver");
-    return;
-  }
-
-  // Start TWAI driver
-  if (twai_start() == ESP_OK) {
-    Serial.println("Driver started");
-  } else {
-    Serial.println("Failed to start driver");
-    return;
-  }
-
-  // Reconfigure alerts to detect TX alerts and Bus-Off errors
-  uint32_t alerts_to_enable = TWAI_ALERT_TX_IDLE | TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED | TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_ERROR;
-  if (twai_reconfigure_alerts(alerts_to_enable, NULL) == ESP_OK) {
-    Serial.println("CAN Alerts reconfigured");
-  } else {
-    Serial.println("Failed to reconfigure alerts");
-    return;
-  }
 
   // Create Event groups
   eg = xEventGroupCreate();
@@ -180,11 +135,11 @@ void setup() {
   logQ = xQueueCreate(64, sizeof(LogMsg));  // tune depth for bursts
 
   // Create and start tasks
-  xTaskCreate(Task_CANHandle, "Task CAN", 4096, NULL, 2, NULL);  
-  xTaskCreate(Task_BMSHandle, "Task BMS", 4096, NULL, 2, NULL);
-  //xTaskCreate(Task_MQTTHandle, "Task MQTT", 4096, NULL, 2, NULL);
+  xTaskCreate(Task_ComsHandle, "Task Coms", 4096, NULL, 2, NULL);  
   xTaskCreate(Task_LEDHandle, "Task LEDs", 4096, NULL, 2, NULL);
-  xTaskCreate(Task_ComsHandle, "Task Coms", 4096, NULL, 2, NULL);
+  xTaskCreate(Task_BMSHandle, "Task BMS", 4096, NULL, 2, NULL);    
+  xTaskCreate(Task_CANHandle, "Task CAN", 4096, NULL, 2, NULL);  
+  xTaskCreate(Task_MQTTHandle, "Task MQTT", 4096, NULL, 2, NULL);
   Serial.println("Tasks started");  
 }
 
@@ -193,9 +148,8 @@ void loop() {
 }
 
 // ####################################################################################################################
-// --------------------------------------------------------------------------------------------------------------------
+// MQTT Callback function----------------------------------------------------------------------------------------------
 // ####################################################################################################################
-// MQTT Callback function
 void callback(char* topic, byte* payload, unsigned int length)
 {
   // Log topic + payload as text (bounded). Note: payload may be binary.
@@ -228,9 +182,8 @@ void callback(char* topic, byte* payload, unsigned int length)
 }
 
 // ####################################################################################################################
-// --------------------------------------------------------------------------------------------------------------------
+// Regularly call this to re-establish MQTT and WiFi connections if lost-----------------------------------------------
 // ####################################################################################################################
-// Regularly call this to re-establish MQTT and WiFi connections if lost
 void maintainConnections() {
   // 1) Ensure WiFi
   if (WiFi.status() != WL_CONNECTED) {
@@ -275,7 +228,7 @@ void maintainConnections() {
 }
 
 // ####################################################################################################################
-// --------------------------------------------------------------------------------------------------------------------
+// Send a CAN packet and keep tally of errors/successful transmissions-------------------------------------------------
 // ####################################################################################################################
 esp_err_t SendCAN_Packet(uint16_t Address, uint8_t Msg_Length, uint8_t * Msg) 
 {
@@ -285,7 +238,7 @@ esp_err_t SendCAN_Packet(uint16_t Address, uint8_t Msg_Length, uint8_t * Msg)
 
   // 1) Validate arguments
   if (!Msg || Msg_Length == 0 || Msg_Length > TWAI_DATA_LENGTH_CODE_MAX) {
-      logf("CAN ERR: invalid args ptr=%p len=%u", Msg, Msg_Length);
+      //logf("CAN ERR: invalid args ptr=%p len=%u", Msg, Msg_Length);
       return ESP_ERR_INVALID_ARG;
   }
 
@@ -316,12 +269,12 @@ esp_err_t SendCAN_Packet(uint16_t Address, uint8_t Msg_Length, uint8_t * Msg)
 }
 
 // ####################################################################################################################
-// --------------------------------------------------------------------------------------------------------------------
+// communication with Victron system over CAN--------------------------------------------------------------------------
 // ####################################################################################################################
-void VEcan() //communication with Victron system over CAN
+void VEcan() 
 {
   uint8_t mes[8];
-  uint8_t bmsmanu[8] = {'J', 'A', 'M', 'E', 'S', '-', 'F', '.'};
+  uint8_t bmsmanu[8] = {'M', 'I', 'N', 'I', '-', 'B', 'M', 'S'};
 
   mes[0] = lowByte(CVL_Vx10);
   mes[1] = highByte(CVL_Vx10);
@@ -350,8 +303,8 @@ void VEcan() //communication with Victron system over CAN
   mes[1] = highByte(uint16_t(StackVoltage_mV / 10));
   mes[2] = lowByte(uint16_t(currentact / 100));
   mes[3] = highByte(uint16_t(currentact / 100));
-  mes[4] = lowByte(uint16_t(AvgTemperature * 10));
-  mes[5] = highByte(uint16_t(AvgTemperature * 10));
+  mes[4] = lowByte(uint16_t(PackTemperature * 10));
+  mes[5] = highByte(uint16_t(PackTemperature * 10));
   mes[6] = 0;  mes[7] = 0;
 
   SendCAN_Packet(0x356, 8, mes);
@@ -382,7 +335,8 @@ static inline void applyMode(LedState& L)
     case LED_BLINK_FAST:    L.on_ms = 100; L.off_ms = 100; break;                         // 5 Hz 50% (adjust as needed)
     case LED_BLINK_BALANCE: L.on_ms= 80;  L.off_ms = 170; break;                         // ~4 Hz (80/170)
     case LED_BLINK_COV:     L.on_ms= 2000;  L.off_ms = 200; break;                        
-    case LED_BLINK_CUV:     L.on_ms= 100;  L.off_ms = 200; break;                      
+    case LED_BLINK_CUV:     L.on_ms= 100;  L.off_ms = 200; break;               
+    case LED_BLINK_ALIVE:   L.on_ms= 50;  L.off_ms = 5000; break;        
   }
 }
 
@@ -403,9 +357,8 @@ static inline void updateLed(LedState& L, uint32_t now)
 }
 
 // ####################################################################################################################
-// --------------------------------------------------------------------------------------------------------------------
+// Use from any task (non-ISR)-----------------------------------------------------------------------------------------
 // ####################################################################################################################
-// Use from any task (non-ISR)
 void logf(const char* fmt, ...) {
   char tmp[LOG_LINE_MAX];
   va_list ap; va_start(ap, fmt);
@@ -425,24 +378,50 @@ void logf(const char* fmt, ...) {
 // ####################################################################################################################
 // --------------------------------------------------------------------------------------------------------------------
 // ####################################################################################################################
-
-
-// ####################################################################################################################
-// --------------------------------------------------------------------------------------------------------------------
-// ####################################################################################################################
-
-
-// ####################################################################################################################
 // --------------------------------------------------------------------------------------------------------------------
 // ####################################################################################################################
 void Task_CANHandle(void *pvParameters)
 {
   const TickType_t period = pdMS_TO_TICKS(200);
 
+  // Initialize CAN configuration structures using macro initializers
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX, (gpio_num_t)CAN_RX, TWAI_MODE_NO_ACK);  // TWAI_MODE_NO_ACK   TWAI_MODE_NORMAL
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS(); 
+  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  // Install TWAI driver 
+  if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
+    logf("Driver installed\n");
+  } else {
+    logf("Failed to install driver\n");
+    return;
+  }
+
+  // Start TWAI driver
+  if (twai_start() == ESP_OK) {
+    logf("Driver started\n");
+  } else {
+    logf("Failed to start driver\n");
+    return;
+  }
+
+  // Reconfigure alerts to detect TX alerts and Bus-Off errors
+  uint32_t alerts_to_enable = TWAI_ALERT_TX_IDLE | TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED | TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_ERROR;
+  if (twai_reconfigure_alerts(alerts_to_enable, NULL) == ESP_OK) {
+    logf("CAN Alerts reconfigured\n");
+  } else {
+    logf("Failed to reconfigure alerts\n");
+    return;
+  }
+
+  // Configure Enable / stanby
+  // digitalWrite(CAN_EN, HIGH); pinMode(CAN_EN, OUTPUT);              // This enables the CAN DC-DC converter
+  digitalWrite(CAN_STB, LOW); pinMode(CAN_STB, OUTPUT);             // This takes the chip out of standby mode 
+
   for (;;)
   {
+    vTaskDelay(period);    
     VEcan();
-    vTaskDelay(period);
   }
 }
 
@@ -450,39 +429,67 @@ void Task_CANHandle(void *pvParameters)
 void Task_BMSHandle(void *pvParameters)
 {
   const TickType_t tick200ms = pdMS_TO_TICKS(200);
-  const TickType_t tick5s    = pdMS_TO_TICKS(5000);
+  const TickType_t tick3s    = pdMS_TO_TICKS(3000);
 
   TickType_t last200ms = xTaskGetTickCount();
-  TickType_t last5s  = xTaskGetTickCount();
+  TickType_t last3s  = xTaskGetTickCount();
 
   static uint16_t MaxCellVoltage_mV = 3200;
   static uint16_t MinCellVoltage_mV = 3200; 
 
+  static TickType_t cuv_latch_until = 0;
+  static TickType_t cov_latch_until = 0;
+
+  // Register the current task for monitoring by the watchdog
+  ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+  logf("TWDT configured\n");
+  esp_task_wdt_reset();
+
+  // Configure pins
+  //HWSerial.begin(2400, SERIAL_8N1, -1, 10); //HWSerial.println("COV");        // Future comms mode for daisy chaining BMS modules
+  pinMode(AUX_1_PIN, OUTPUT); digitalWrite(AUX_1_PIN, HIGH);
+  pinMode(AUX_2_PIN, INPUT);
+  pinMode(AUX_3_PIN, OUTPUT); digitalWrite(AUX_3_PIN, HIGH);  
+  pinMode(AUX_4_PIN, INPUT);
+
   for(;;)  {
     TickType_t now = xTaskGetTickCount();
-    if (now - last5s >= tick5s) {
-      last5s = now; 
+    if (now - last3s >= tick3s) {
+      last3s = now; 
+
+      esp_task_wdt_reset();                                           // This task is subject to a watchdog because it is vital that it continues to run properly
                
       int8_t Alert_A = bms.directCommandRead(DIR_CMD_FPROTEC);        // Read the protection registers
       int8_t Alert_B = bms.directCommandRead(DIR_CMD_FTEMP);
     
-      if(Alert_A & 0b0100)	{					                                // CUV Fault - disable inverter
-        digitalWrite(AUX_1_PIN, HIGH);		
-        xEventGroupSetBits(eg, CUV_BIT);
+      // Re-arm the latches if a fault bit is present
+      if (Alert_A & 0b0100) { // CUV
+          cuv_latch_until = now + pdMS_TO_TICKS(CUOV_LATCH_TIME);
       }
-      else {
-        digitalWrite(AUX_1_PIN, LOW);
-        xEventGroupClearBits(eg, CUV_BIT);	
+      if (Alert_A & 0b1000) { // COV
+          cov_latch_until = now + pdMS_TO_TICKS(CUOV_LATCH_TIME);
       }
-        
-      if(Alert_A & 0b1000)	{					                                // COV Fault - disable charging
-        digitalWrite(AUX_3_PIN, HIGH);
-        xEventGroupSetBits(eg, COV_BIT);
+
+      // Wrap-safe expiry check written inline:
+      bool cov_active = (Alert_A & 0b1000) || ((int32_t)(cov_latch_until - now) > 0);      
+      bool cuv_active = (Alert_A & 0b0100) || ((int32_t)(cuv_latch_until - now) > 0);
+
+      // Apply actions
+      if (cov_active) {
+          digitalWrite(AUX_1_PIN, HIGH);          
+          xEventGroupSetBits(eg, COV_BIT);
+      } else {
+          digitalWrite(AUX_1_PIN, LOW);          
+          xEventGroupClearBits(eg, COV_BIT);
       }
-      else {
-        digitalWrite(AUX_3_PIN, LOW);	
-        xEventGroupClearBits(eg, COV_BIT);
-      } 
+
+      if (cuv_active) {
+          digitalWrite(AUX_3_PIN, HIGH);
+          xEventGroupSetBits(eg, CUV_BIT);
+      } else {
+          digitalWrite(AUX_3_PIN, LOW);
+          xEventGroupClearBits(eg, CUV_BIT);
+      }
 
       if(bms.isBalancing()) {
         xEventGroupSetBits(eg, BALANCING_BIT);
@@ -523,8 +530,10 @@ void Task_BMSHandle(void *pvParameters)
 
       // Temperature (float)
       {
-        float t = bms.getInternalTemp();
-        logf("Temp: %.2f\n", (double)t);
+        float ti = bms.getInternalTemp();        
+        PackTemperature = bms.getThermistorTemp(TS1);
+        if(PackTemperature < -25.0) {PackTemperature = 25.0;}                             // If Pack temperature is that cold it'll be because the thermistor is not connected. So default
+        logf("BQ Temp: %.1f, TS1 Temp: %.1f\n", (double)ti, (double)PackTemperature);
       }
 
       // DASTATUS_5 and Stack Voltage
@@ -550,7 +559,7 @@ void Task_BMSHandle(void *pvParameters)
       }
     }  
 
-    Telemetry tele { .maxCell_mV = MaxCellVoltage_mV, .minCell_mV = MinCellVoltage_mV, .pack_mV = StackVoltage_mV };
+    Telemetry tele { .maxCell_mV = MaxCellVoltage_mV, .minCell_mV = MinCellVoltage_mV, .pack_mV = StackVoltage_mV, .pack_temp = PackTemperature };
     static LimitsState st;
     computeLimits(tele, st, lim, 0.2f);                             // dt=0.2 s if you call at 5 Hz
     toVictronScaling(lim, CVL_Vx10, CCL_Ax10, DCL_Ax10);     
@@ -649,8 +658,14 @@ void Task_LEDHandle(void *pvParameters)
     // Red LED
     bool cov_fault = (b & COV_BIT);
     bool cuv_fault = (b & CUV_BIT);
-    ledR.mode = cov_fault ? LED_BLINK_COV : LED_OFF;
-    ledR.mode = cuv_fault ? LED_BLINK_CUV : ledR.mode;
+    
+    if (cuv_fault) {
+        ledR.mode = LED_BLINK_CUV;     
+    } else if (cov_fault) {
+        ledR.mode = LED_BLINK_COV;
+    } else {
+        ledR.mode = LED_BLINK_ALIVE;
+    }
 
     // If modes changed since last loop, re-apply timing
     static LedMode prevG = (LedMode)255, prevR = (LedMode)255;

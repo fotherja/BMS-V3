@@ -65,6 +65,15 @@ void computeLimits(const Telemetry& t, LimitsState& s, Limits& out, float dt_s)
     float frac = clampT<float>((float)num / (float)den, 0.0f, 1.0f);
     ccl_target_mA = (uint32_t)(frac * (float)MAX_CCL_mA);
   }
+
+  // Temperature-based CCL
+  if (t.pack_temp <= T_BLOCK_CHARGE_C) {
+    ccl_target_mA = 0;
+  }
+  else if (t.pack_temp < T_CCL_CLAMP_C) {
+    ccl_target_mA = clampT<uint32_t>(ccl_target_mA, 0u, CCL_COLD_CAP_mA);
+  }
+
   // Slew-limit CCL
   out.CCL_mA = slewToward(s.prevCCL_mA, ccl_target_mA, CCL_SLEW_mA_per_s, dt_s);
   s.prevCCL_mA = out.CCL_mA;
