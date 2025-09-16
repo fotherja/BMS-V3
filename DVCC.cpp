@@ -32,11 +32,7 @@ void computeLimits(const Telemetry& t, LimitsState& s, Limits& out, float dt_s)
   int32_t over_mV = (int32_t)t.maxCell_mV - (int32_t)V_SOFT_HIGH_mV;
   int32_t trim_pc_mV = (over_mV > 0) ? (over_mV * CVL_Kp_pc) : 0;
 
-  uint32_t cvl_pc_mV = clampT<int32_t>(
-      (int32_t)CVL_BASE_PC_mV - trim_pc_mV,
-      (int32_t)CVL_MIN_PC_mV,
-      (int32_t)CVL_BASE_PC_mV
-  );
+  uint32_t cvl_pc_mV = clampT<int32_t>((int32_t)CVL_BASE_PC_mV - trim_pc_mV, (int32_t)CVL_MIN_PC_mV, (int32_t)CVL_BASE_PC_mV);
   uint32_t cvl_target_mV = (uint32_t)NUM_OF_CELLS * cvl_pc_mV;
 
   // Keep CVL at least a little above present pack voltage to avoid stalling/oscillation
