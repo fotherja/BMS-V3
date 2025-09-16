@@ -5,13 +5,10 @@
 * License     :   MIT
 * This code is published as open source software. Feel free to share/modify.
 *
-* Victron sends a heart beat on 0x305
-* 
-*
 * To Do:
-*   - Rx Current rather than balancing permission and copy this to currentact
-*   - Fault catching, error checks
 *   - ODP programme chip
+*   - Check mqtt current is coming through 
+*   - Get rid of balance permission and just base it off current
 *
 *
 * Future:
@@ -31,9 +28,15 @@
 #include "DVCC.h"
 #include <esp_task_wdt.h>
 
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
 //--------------------------------------------------
 #define TWAI_DATA_LENGTH_CODE_MAX   8
-#define CAN_TX_TIMEOUT_MS           100
+#define CAN_TX_QUEUE_TIMEOUT_MS     2                               // wait to enqueue into TX queue
+#define CAN_TX_RESULT_TIMEOUT_MS    100                             // wait for success/fail alert after enqueue
 
 //------------- Pin definitions --------------------
 #define LED_GREEN_PIN       21  //0
@@ -60,16 +63,27 @@
 #define UART_RX             17
 
 #define CUOV_LATCH_TIME      60000
+
+// ---- Config UUIDs (pick your own if you like) ----
+static const char* CELL_SERVICE_UUID = "df576e4d-c394-49b8-a13b-7b55b86439a7";
+static const char* CELL_ARRAY_UUID   = "fc36e5ed-83ba-47f3-970c-233dfcff4ac8";
+
 //------------- Variables --------------------
 // Your credentials
-// const char*               ssid = "venus-HQ2306ZHQGJ-f3b";         
-// const char*               password = "zz6tzefc";                 
-// const char*               mqtt_server = "192.168.188.122";
+const char*               ssid = "venus-HQ2306ZHQGJ-f3b";         
+const char*               password = "zz6tzefc";                 
+const char*               mqtt_server = "192.168.188.122";
 
 BQ76952                   bms;
 WiFiClient                espClient;
 PubSubClient              client(espClient);
 HardwareSerial            HWSerial(1);                               // use UART1
+
+BLEServer*                gServer      = nullptr;
+BLECharacteristic*        gCellChar    = nullptr;
+
+volatile bool             gDeviceConnected     = false;
+volatile bool             gOldDeviceConnected  = false;
 
 EventGroupHandle_t        eg;
 constexpr EventBits_t     BALANCING_BIT = BIT0;
@@ -91,8 +105,7 @@ uint16_t                  CVL_Vx10, CCL_Ax10, DCL_Ax10;
 Limits                    lim;
 
 float                     PackTemperature = 20.5;
-uint16_t                  currentact = 0;
-uint16_t                  SOH = 100, SOC = 80;
+uint16_t                  SOC = 80, currentact = 0; 
 
 // ####################################################################################################################
 // --------------------------------------------------------------------------------------------------------------------
@@ -107,16 +120,16 @@ void setup() {
   // Configure the BQ76952:
   bms.setConnectedCells(NUM_OF_CELLS);  
 
-  bms.writeByteToMemory(CUV_Threshold, 65);                         //bms.writeByteToMemory(CUV_Threshold, 55);                         // Set Cell undervoltage protection to 2.75 volts (units: 50.6 mV)
-  bms.writeByteToMemory(COV_Threshold, 83);                         //bms.writeByteToMemory(COV_Threshold, 68);                         // Set Cell overvoltage protection to 3.45 volts 
+  bms.writeByteToMemory(CUV_Threshold, 55);                         // Set Cell undervoltage protection to 2.78 volts (units: 50.6 mV)
+  bms.writeByteToMemory(COV_Threshold, 71);                         // Set Cell overvoltage protection to 3.54 volts 
   bms.writeIntToMemory(CUV_Delay, 1513);                            // 5 Second delay before a CUV/COV triggers a fault. Default 100 mV hysterisis
   bms.writeIntToMemory(COV_Delay, 1513);
 
   bms.writeByteToMemory(Enabled_Protections_A, 0b00001100);         // Enable CUV, COV circuit protection
   bms.writeByteToMemory(Enabled_Protections_B, 0b01000000);         // Enable internal overtemp protection 80-65 celcius
 
-  bms.writeIntToMemory(Cell_Balance_Min_Cell_V_Relaxed, 3700);      // bms.writeIntToMemory(Cell_Balance_Min_Cell_V_Relaxed, 3350);      // Only balance when cells above 3350 mV (Top balance)
-  bms.writeByteToMemory(Cell_Balance_Max_Cells, 3);                 // Allows up to 8 simultaneous cells to be balanced
+  bms.writeIntToMemory(Cell_Balance_Min_Cell_V_Relaxed, 3350);      // Only balance when cells above 3350 mV (Top balance)
+  bms.writeByteToMemory(Cell_Balance_Max_Cells, 3);                 // Allows up to 3 simultaneous cells to be balanced
   bms.writeByteToMemory(DA_Configuration, 0b00001101);              // Set chip die to be for cell temp measurment
   bms.writeByteToMemory(Cell_Open_Wire_Check_Time, 250);            // Set to 250 seconds to reduce unbalanced cell currents  
 
@@ -135,11 +148,12 @@ void setup() {
   logQ = xQueueCreate(64, sizeof(LogMsg));  // tune depth for bursts
 
   // Create and start tasks
-  xTaskCreate(Task_ComsHandle, "Task Coms", 4096, NULL, 2, NULL);  
+  xTaskCreate(Task_ComsHandle, "Task Coms", 8192, NULL, 2, NULL);  
   xTaskCreate(Task_LEDHandle, "Task LEDs", 4096, NULL, 2, NULL);
   xTaskCreate(Task_BMSHandle, "Task BMS", 4096, NULL, 2, NULL);    
   xTaskCreate(Task_CANHandle, "Task CAN", 4096, NULL, 2, NULL);  
-  xTaskCreate(Task_MQTTHandle, "Task MQTT", 4096, NULL, 2, NULL);
+  xTaskCreate(Task_MQTTHandle, "Task MQTT", 8192, NULL, 2, NULL);
+  xTaskCreate(Task_BLEHandle, "Task BLE", 8192, NULL, 2, NULL);
   Serial.println("Tasks started");  
 }
 
@@ -163,7 +177,7 @@ void callback(char* topic, byte* payload, unsigned int length)
     }
   }
 
-  if (strcmp(topic, "battery/SOC") == 0) {
+  if (strcmp(topic, "battery/soc") == 0) {
     // Convert payload to string and ensure it's null-terminated
     char soc_str[16] = {0};  
     unsigned int copy_len = (length < sizeof(soc_str) - 1) ? length : (sizeof(soc_str) - 1);
@@ -176,8 +190,21 @@ void callback(char* topic, byte* payload, unsigned int length)
     // clamp value between 0 and 100
     if (value >= 0.0 && value <= 100.0) {
       SOC = round(value);
-      logf("SOC: %.1f%%\n", SOC); 
+      logf("battery/soc: %.1f%%\n", value); 
     } 
+  }
+
+  if (strcmp(topic, "battery/current") == 0) {
+    // Convert payload to string and ensure it's null-terminated
+    char I_str[16] = {0};  
+    unsigned int copy_len = (length < sizeof(I_str) - 1) ? length : (sizeof(I_str) - 1);
+    memcpy(I_str, payload, copy_len);
+    I_str[copy_len] = '\0';
+
+    // Convert to float
+    float value = atof(I_str);
+    currentact = round(value);
+    logf("battery/current: %.1f%%\n", value); 
   }
 }
 
@@ -218,8 +245,10 @@ void maintainConnections() {
       logf("MQTT connected as %s\n", clientId);
       client.subscribe("Balancing/permission");
       logf("MQTT subscribed: %s\n", "Balancing/permission");
-      client.subscribe("battery/SOC");
-      logf("MQTT subscribed: %s\n", "battery/SOC");
+      client.subscribe("battery/soc");
+      logf("MQTT subscribed: %s\n", "battery/soc");
+      client.subscribe("battery/current");
+      logf("MQTT subscribed: %s\n", "battery/current");
     } else {
       logf("MQTT connect failed. state=%d\n", client.state());
       // Non-blocking; will try again on next maintainConnections()
@@ -230,82 +259,180 @@ void maintainConnections() {
 // ####################################################################################################################
 // Send a CAN packet and keep tally of errors/successful transmissions-------------------------------------------------
 // ####################################################################################################################
-esp_err_t SendCAN_Packet(uint16_t Address, uint8_t Msg_Length, uint8_t * Msg) 
+esp_err_t SendCAN_Packet(uint16_t Address, uint8_t Msg_Length, uint8_t * Msg)
 {
   static uint16_t can_tx_ok = 0;
   static uint16_t can_tx_fail = 0;
   static uint32_t last_report_ticks = 0;
 
-  // 1) Validate arguments
+  static bool     s_recovery_initiated = false;
+
+  // 0) Validate arguments
   if (!Msg || Msg_Length == 0 || Msg_Length > TWAI_DATA_LENGTH_CODE_MAX) {
-      //logf("CAN ERR: invalid args ptr=%p len=%u", Msg, Msg_Length);
-      return ESP_ERR_INVALID_ARG;
+    return ESP_ERR_INVALID_ARG;
   }
 
-  // 2) Prepare message (zero-init for flags)
-  twai_message_t message = { 0 };
+  // 1) Check controller state cheaply; avoid TX while BUS_OFF/RECOVERING
+  twai_status_info_t st;
+  if (twai_get_status_info(&st) == ESP_OK) {
+    if (st.state == TWAI_STATE_BUS_OFF) {
+      if (!s_recovery_initiated) {
+        (void)twai_initiate_recovery();   // kick off recovery once
+        s_recovery_initiated = true;
+      }
+      can_tx_fail++;                      // count this attempt as a fail
+      // Optional: brief yield to avoid hammering this path
+      vTaskDelay(pdMS_TO_TICKS(1));
+      return ESP_ERR_INVALID_STATE;
+    } else if (st.state == TWAI_STATE_RECOVERING) {
+      // Still waiting for 128*11 recessive bits; TX won’t work yet
+      can_tx_fail++;
+      vTaskDelay(pdMS_TO_TICKS(1));
+      return ESP_ERR_INVALID_STATE;
+    }
+  }
+
+  // 2) Drain any stale alerts quickly so we don't misattribute outcomes
+  {
+    uint32_t dummy;
+    // Non-blocking reads to clear backlog (max a few iterations)
+    for (int i = 0; i < 4; ++i) {
+      if (twai_read_alerts(&dummy, 0) != ESP_OK) break;
+    }
+  }
+
+  // 3) Build single-shot message (no automatic retransmission)
+  twai_message_t message = {0};
   message.identifier       = Address;
   message.data_length_code = Msg_Length;
-  message.extd             = 0;  // standard ID
-  message.rtr              = 0;  // no remote frame
+  message.extd             = 0;                 // standard ID
+  message.rtr              = 0;                 // data frame
+  message.flags            = TWAI_MSG_FLAG_SS;  // SINGLE SHOT: try once, don't retry
   memcpy(message.data, Msg, Msg_Length);
 
-  // 3) Transmit
-  esp_err_t err = twai_transmit(&message, pdMS_TO_TICKS(CAN_TX_TIMEOUT_MS));
-  if (err == ESP_OK) {
-      can_tx_ok++;
+  // 4) Try to enqueue the frame (short, bounded wait)
+  esp_err_t err = twai_transmit(&message, pdMS_TO_TICKS(CAN_TX_QUEUE_TIMEOUT_MS));
+  if (err != ESP_OK) {
+    // NOT_STARTED / INVALID_STATE / QUEUE_FULL / TIMEOUT, etc.
+    can_tx_fail++;
   } else {
+    // Single blocking wait for the transmission outcome
+    uint32_t alerts = 0;
+
+    if (twai_read_alerts(&alerts, pdMS_TO_TICKS(CAN_TX_RESULT_TIMEOUT_MS)) != ESP_OK) {
+      // No alert within window (bus quiet/disconnected?)
       can_tx_fail++;
+      err = ESP_ERR_TIMEOUT;
+    } else {
+      // Prioritise hard error first
+      if (alerts & TWAI_ALERT_BUS_OFF) {
+        (void)twai_initiate_recovery();
+        s_recovery_initiated = true;
+        can_tx_fail++;
+        err = ESP_ERR_INVALID_STATE;
+      } else if (alerts & TWAI_ALERT_TX_SUCCESS) {
+        // Frame went out and was ACKed
+        can_tx_ok++;
+        err = ESP_OK;
+      } else if (alerts & (TWAI_ALERT_TX_FAILED | TWAI_ALERT_ARB_LOST)) {
+        // Single-shot: no retry; treat as failed attempt
+        can_tx_fail++;
+        err = ESP_FAIL;
+      } else {
+        // Got some other alert (e.g., ERR_PASS/BUS_ERROR/TX_IDLE) without a decisive result
+        can_tx_fail++;
+        err = ESP_FAIL;
+      }
+
+      // Informational: clear recovery flag if notified
+      if (alerts & TWAI_ALERT_BUS_RECOVERED) {
+        s_recovery_initiated = false;
+      }
+    }
   }
 
-  // Report every 5000 ms (5 s)
-  TickType_t now = xTaskGetTickCount();
-  if ((now - last_report_ticks) >= pdMS_TO_TICKS(5000)) {
+  // 5) Periodic stats (every 5 s)
+  {
+    TickType_t now = xTaskGetTickCount();
+    if ((now - last_report_ticks) >= pdMS_TO_TICKS(5000)) {
       logf("CAN TX: ok=%u fail=%u\n", can_tx_ok, can_tx_fail);
       last_report_ticks = now;
+    }
   }
 
-  return err;
+  return err; // ESP_OK only if ACKed; otherwise ESP_FAIL/ESP_ERR_TIMEOUT/ESP_ERR_INVALID_STATE etc.
 }
+
+// OLD CODE FOR DELETION ONCE NEW CODE ABOVE VALIDATED
+//-------------------------------------------------------------------------------------
+// #define CAN_TX_TIMEOUT_MS           100
+
+// esp_err_t SendCAN_Packet(uint16_t Address, uint8_t Msg_Length, uint8_t * Msg) 
+// {
+//   static uint16_t can_tx_ok = 0;
+//   static uint16_t can_tx_fail = 0;
+//   static uint32_t last_report_ticks = 0;
+
+//   // 1) Validate arguments
+//   if (!Msg || Msg_Length == 0 || Msg_Length > TWAI_DATA_LENGTH_CODE_MAX) {
+//       //logf("CAN ERR: invalid args ptr=%p len=%u", Msg, Msg_Length);
+//       return ESP_ERR_INVALID_ARG;
+//   }
+
+//   // 2) Prepare message (zero-init for flags)
+//   twai_message_t message = { 0 };
+//   message.identifier       = Address;
+//   message.data_length_code = Msg_Length;
+//   message.extd             = 0;             // standard ID
+//   message.rtr              = 0;             // no remote frame
+//   memcpy(message.data, Msg, Msg_Length);
+
+//   // 3) Transmit
+//   esp_err_t err = twai_transmit(&message, pdMS_TO_TICKS(CAN_TX_TIMEOUT_MS));
+//   if (err == ESP_OK) {
+//       can_tx_ok++;
+//   } else {
+//       can_tx_fail++;
+//   }
+
+//   // Report every 5000 ms (5 s)
+//   TickType_t now = xTaskGetTickCount();
+//   if ((now - last_report_ticks) >= pdMS_TO_TICKS(5000)) {
+//       logf("CAN TX: ok=%u fail=%u\n", can_tx_ok, can_tx_fail);
+//       last_report_ticks = now;
+//   }
+
+//   return err;
+// }
 
 // ####################################################################################################################
 // communication with Victron system over CAN--------------------------------------------------------------------------
 // ####################################################################################################################
 void VEcan() 
 {
-  uint8_t mes[8];
-  uint8_t bmsmanu[8] = {'M', 'I', 'N', 'I', '-', 'B', 'M', 'S'};
+  uint8_t mes[8], SOH = 100;
+  uint8_t bmsmanu[8] = {'M', 'I', 'N', 'I', ' ', 'B', 'M', 'S'};
 
-  mes[0] = lowByte(CVL_Vx10);
-  mes[1] = highByte(CVL_Vx10);
-  mes[2] = lowByte(CCL_Ax10);
-  mes[3] = highByte(CCL_Ax10);
-  mes[4] = lowByte(DCL_Ax10);
-  mes[5] = highByte(DCL_Ax10);
-  mes[6] = lowByte(480);
-  mes[7] = highByte(480);
+  mes[0] = lowByte(CVL_Vx10);                         mes[1] = highByte(CVL_Vx10);
+  mes[2] = lowByte(CCL_Ax10);                         mes[3] = highByte(CCL_Ax10);
+  mes[4] = lowByte(DCL_Ax10);                         mes[5] = highByte(DCL_Ax10);
+  mes[6] = lowByte(480);                              mes[7] = highByte(480);
 
   SendCAN_Packet(0x351, 8, mes);
   vTaskDelay(5);
 
-  mes[0] = lowByte(SOC);
-  mes[1] = highByte(SOC);
-  mes[2] = lowByte(SOH);
-  mes[3] = highByte(SOH);
-  mes[4] = lowByte(SOC * 10);
-  mes[5] = highByte(SOC * 10);
-  mes[6] = 0;  mes[7] = 0;
+  mes[0] = lowByte(SOC);                              mes[1] = highByte(SOC);
+  mes[2] = lowByte(SOH);                              mes[3] = highByte(SOH);
+  mes[4] = lowByte(SOC * 10);                         mes[5] = highByte(SOC * 10);
+  mes[6] = 0;                                         mes[7] = 0;
 
   SendCAN_Packet(0x355, 8, mes);
   vTaskDelay(5);
 
-  mes[0] = lowByte(uint16_t(StackVoltage_mV / 10));
-  mes[1] = highByte(uint16_t(StackVoltage_mV / 10));
-  mes[2] = lowByte(uint16_t(currentact / 100));
-  mes[3] = highByte(uint16_t(currentact / 100));
-  mes[4] = lowByte(uint16_t(PackTemperature * 10));
-  mes[5] = highByte(uint16_t(PackTemperature * 10));
-  mes[6] = 0;  mes[7] = 0;
+  mes[0] = lowByte(uint16_t(StackVoltage_mV));        mes[1] = highByte(uint16_t(StackVoltage_mV));
+  mes[2] = lowByte(uint16_t(currentact * 10));        mes[3] = highByte(uint16_t(currentact * 10));
+  mes[4] = lowByte(uint16_t(PackTemperature * 10));   mes[5] = highByte(uint16_t(PackTemperature * 10));
+  mes[6] = 0;                                         mes[7] = 0;
 
   SendCAN_Packet(0x356, 8, mes);
   vTaskDelay(5);
@@ -313,8 +440,7 @@ void VEcan()
   SendCAN_Packet(0x35E, 8, bmsmanu); 
   vTaskDelay(5);
 
-  mes[0] = 0;  mes[1] = 0;  mes[2] = 0;  mes[3] = 0;
-  mes[4] = 0;  mes[5] = 0;  mes[6] = 0;  mes[7] = 0;
+  mes[0] = 0; mes[1] = 0; mes[2] = 0; mes[3] = 0; mes[4] = 0; mes[5] = 0; mes[6] = 0; mes[7] = 0;
 
   SendCAN_Packet(0x35A, 8, mes);
   vTaskDelay(5);
@@ -329,14 +455,14 @@ void VEcan()
 static inline void applyMode(LedState& L)
 {
   switch (L.mode) {
-    case LED_OFF:           L.on_ms = 0;   L.off_ms = 0;   L.level = LOW;  break;
-    case LED_ON:            L.on_ms = 0;   L.off_ms = 0;   L.level = HIGH; break;
-    case LED_BLINK_SLOW:    L.on_ms = 1000; L.off_ms = 1000; break;                       // 0.5 Hz
-    case LED_BLINK_FAST:    L.on_ms = 100; L.off_ms = 100; break;                         // 5 Hz 50% (adjust as needed)
-    case LED_BLINK_BALANCE: L.on_ms= 80;  L.off_ms = 170; break;                         // ~4 Hz (80/170)
-    case LED_BLINK_COV:     L.on_ms= 2000;  L.off_ms = 200; break;                        
-    case LED_BLINK_CUV:     L.on_ms= 100;  L.off_ms = 200; break;               
-    case LED_BLINK_ALIVE:   L.on_ms= 50;  L.off_ms = 5000; break;        
+    case LED_OFF:           L.on_ms = 0;    L.off_ms = 0;     L.level = LOW;  break;
+    case LED_ON:            L.on_ms = 0;    L.off_ms = 0;     L.level = HIGH; break;
+    case LED_BLINK_SLOW:    L.on_ms = 1000; L.off_ms = 1000;                  break;                       
+    case LED_BLINK_FAST:    L.on_ms = 100;  L.off_ms = 100;                   break;         
+    case LED_BLINK_BALANCE: L.on_ms= 80;    L.off_ms = 170;                   break;                        
+    case LED_BLINK_COV:     L.on_ms= 2000;  L.off_ms = 200;                   break;                        
+    case LED_BLINK_CUV:     L.on_ms= 100;   L.off_ms = 200;                   break;               
+    case LED_BLINK_ALIVE:   L.on_ms= 50;    L.off_ms = 5000;                  break;        
   }
 }
 
@@ -345,8 +471,8 @@ static inline void applyMode(LedState& L)
 // ####################################################################################################################
 static inline void updateLed(LedState& L, uint32_t now)
 {
-  if (L.mode == LED_OFF)         { if (L.level != LOW)  { L.level = LOW;  digitalWrite(L.pin, LOW); }  return; }
-  if (L.mode == LED_ON)          { if (L.level != HIGH) { L.level = HIGH; digitalWrite(L.pin, HIGH); } return; }
+  if (L.mode == LED_OFF) { if (L.level != LOW)  { L.level = LOW;  digitalWrite(L.pin, LOW); }  return; }
+  if (L.mode == LED_ON)  { if (L.level != HIGH) { L.level = HIGH; digitalWrite(L.pin, HIGH); } return; }
 
   if ((int32_t)(now - L.next_ms) >= 0) {
     // toggle
@@ -359,7 +485,8 @@ static inline void updateLed(LedState& L, uint32_t now)
 // ####################################################################################################################
 // Use from any task (non-ISR)-----------------------------------------------------------------------------------------
 // ####################################################################################################################
-void logf(const char* fmt, ...) {
+void logf(const char* fmt, ...) 
+{
   char tmp[LOG_LINE_MAX];
   va_list ap; va_start(ap, fmt);
   int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
@@ -376,6 +503,32 @@ void logf(const char* fmt, ...) {
 }
 
 // ####################################################################################################################
+// BLE server connect/disconnect flags --------------------------------------------------------------------------------
+// ####################################################################################################################
+class MyServerCallbacks : public BLEServerCallbacks 
+{
+  void onConnect(BLEServer* s) override { gDeviceConnected = true;  }
+  void onDisconnect(BLEServer* s) override { gDeviceConnected = false; }
+};
+
+// ####################################################################################################################
+// Pack & send the 16 cells (mV) as 32 bytes LE -----------------------------------------------------------------------
+// ####################################################################################################################
+static void notifyCellVoltages() 
+{
+  if (!gCellChar) return;
+
+  uint8_t buf[NUM_OF_CELLS * 2];
+  for (int i = 0; i < NUM_OF_CELLS; ++i) {
+    uint16_t mv = Cell_Voltages[i];
+    buf[2*i + 0] = (uint8_t)(mv & 0xFF);
+    buf[2*i + 1] = (uint8_t)(mv >> 8);
+  }
+  gCellChar->setValue(buf, sizeof(buf));
+  gCellChar->notify();
+}
+
+// ####################################################################################################################
 // --------------------------------------------------------------------------------------------------------------------
 // ####################################################################################################################
 // --------------------------------------------------------------------------------------------------------------------
@@ -385,7 +538,7 @@ void Task_CANHandle(void *pvParameters)
   const TickType_t period = pdMS_TO_TICKS(200);
 
   // Initialize CAN configuration structures using macro initializers
-  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX, (gpio_num_t)CAN_RX, TWAI_MODE_NO_ACK);  // TWAI_MODE_NO_ACK   TWAI_MODE_NORMAL
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX, (gpio_num_t)CAN_RX, TWAI_MODE_NORMAL);
   twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS(); 
   twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
@@ -406,7 +559,8 @@ void Task_CANHandle(void *pvParameters)
   }
 
   // Reconfigure alerts to detect TX alerts and Bus-Off errors
-  uint32_t alerts_to_enable = TWAI_ALERT_TX_IDLE | TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED | TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_ERROR;
+  uint32_t alerts_to_enable = TWAI_ALERT_TX_IDLE | TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED | TWAI_ALERT_ARB_LOST | 
+                              TWAI_ALERT_BUS_ERROR | TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED;
   if (twai_reconfigure_alerts(alerts_to_enable, NULL) == ESP_OK) {
     logf("CAN Alerts reconfigured\n");
   } else {
@@ -415,7 +569,7 @@ void Task_CANHandle(void *pvParameters)
   }
 
   // Configure Enable / stanby
-  // digitalWrite(CAN_EN, HIGH); pinMode(CAN_EN, OUTPUT);              // This enables the CAN DC-DC converter
+  // digitalWrite(CAN_EN, HIGH); pinMode(CAN_EN, OUTPUT);           // CAN transciever is enabled with this line commented out       
   digitalWrite(CAN_STB, LOW); pinMode(CAN_STB, OUTPUT);             // This takes the chip out of standby mode 
 
   for (;;)
@@ -528,11 +682,14 @@ void Task_BMSHandle(void *pvParameters)
         logf("%s\n", buf);
       }
 
-      // Temperature (float)
+      // Temperatures (float)
       {
         float ti = bms.getInternalTemp();        
         PackTemperature = bms.getThermistorTemp(TS1);
-        if(PackTemperature < -25.0) {PackTemperature = 25.0;}                             // If Pack temperature is that cold it'll be because the thermistor is not connected. So default
+
+        // If Pack temperature is < -25C it'll be because the thermistor is not connected. So default to 25C
+        if(PackTemperature < -25.0) {PackTemperature = 25.0;}  
+
         logf("BQ Temp: %.1f, TS1 Temp: %.1f\n", (double)ti, (double)PackTemperature);
       }
 
@@ -557,8 +714,9 @@ void Task_BMSHandle(void *pvParameters)
             (unsigned long)lim.CCL_mA,
             (unsigned long)lim.DCL_mA);         
       }
-    }  
+    }      
 
+    // This section runs every 200 ms and calculated the DVCC values that get sent over CAN
     Telemetry tele { .maxCell_mV = MaxCellVoltage_mV, .minCell_mV = MinCellVoltage_mV, .pack_mV = StackVoltage_mV, .pack_temp = PackTemperature };
     static LimitsState st;
     computeLimits(tele, st, lim, 0.2f);                             // dt=0.2 s if you call at 5 Hz
@@ -571,22 +729,26 @@ void Task_BMSHandle(void *pvParameters)
 // --------------------------------------------------------------------------------------------------------------------
 void Task_MQTTHandle(void *pvParameters)
 {
-  const TickType_t tick200ms = pdMS_TO_TICKS(200);
+  const TickType_t tick200ms  = pdMS_TO_TICKS(200);
   const TickType_t tick20s    = pdMS_TO_TICKS(20000);
   const TickType_t tick60s    = pdMS_TO_TICKS(60000);
   const TickType_t tick15m    = pdMS_TO_TICKS(900000);
 
-  TickType_t last200ms = xTaskGetTickCount();
-  TickType_t last20s  = xTaskGetTickCount() - tick20s;
-  TickType_t last60s = xTaskGetTickCount();
-  TickType_t last15m = xTaskGetTickCount();
+  TickType_t last200ms        = xTaskGetTickCount();
+  TickType_t last20s          = xTaskGetTickCount() - tick20s;
+  TickType_t last60s          = xTaskGetTickCount();
+  TickType_t last15m          = xTaskGetTickCount();
 
   TickType_t now;
 
   for (;;)
   {
+    vTaskDelayUntil(&last200ms, tick200ms);
+
+    // Every 200 milliseconds we service our MQTT client
     client.loop();
 
+    // Every 20 seconds we ensure wifi and MQTT servers are connected
     now = xTaskGetTickCount();
     if (now - last20s >= tick20s) {
       last20s = now; 
@@ -594,6 +756,7 @@ void Task_MQTTHandle(void *pvParameters)
       maintainConnections();      
     }
 
+    // Every 60 seconds we attempt to Tx our cell voltages over MQTT
     now = xTaskGetTickCount();
     if (now - last60s >= tick60s) {      
       last60s = now;  // reset period from actual time
@@ -609,6 +772,7 @@ void Task_MQTTHandle(void *pvParameters)
       client.publish("battery/cell_voltages", voltageJson);
     }
 
+    // Every 15 minutes we attempt to Tx our cell balance times over MQTT
     now = xTaskGetTickCount();
     if (now - last15m >= tick15m) {      
       last15m = now;  // reset period from actual time
@@ -623,8 +787,6 @@ void Task_MQTTHandle(void *pvParameters)
       logf("%s\n", balanceJson);
       client.publish("battery/balance_times", balanceJson); 
     }        
-
-    vTaskDelayUntil(&last200ms, tick200ms);
   }
 }
 
@@ -693,32 +855,76 @@ void Task_ComsHandle(void *pvParameters)
   }
 }
 
+// --------------------------------------------------------------------------------------------------------------------
+void Task_BLEHandle(void *pvParameters)
+{
+  const TickType_t tick3s       = pdMS_TO_TICKS(3000);  
+  const TickType_t period500ms  = pdMS_TO_TICKS(500);  
+  const TickType_t period10ms   = pdMS_TO_TICKS(10);
+
+  TickType_t lastPush           = xTaskGetTickCount();
+
+  TickType_t now;
+
+  // Init BLE once
+  BLEDevice::init("MiniBMS");
+  BLEDevice::setMTU(100);             // helps ensure 32B payload fits in one packet (browser will negotiate)
+
+  // Create server + callbacks
+  gServer = BLEDevice::createServer();
+  gServer->setCallbacks(new MyServerCallbacks());
+
+  // Service
+  BLEService* svc = gServer->createService(CELL_SERVICE_UUID);
+
+  // Characteristic: READ + NOTIFY (no write needed)
+  gCellChar = svc->createCharacteristic(
+    CELL_ARRAY_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  gCellChar->addDescriptor(new BLE2902()); // enables CCCD for notifications
+
+  svc->start();
+
+  // Advertise service
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(CELL_SERVICE_UUID);
+  // adv->setScanResponse(true); // default is fine
+  BLEDevice::startAdvertising();
+
+  logf("BLE waiting for a client...");
 
 
+  for (;;) {
+    now = xTaskGetTickCount();
 
+    // If connected, update the cell values and notify every ~3s
+    if (gDeviceConnected) {
+      if (now - lastPush >= tick3s) {
+        lastPush = now;                
+        notifyCellVoltages();        
+        logf("Pushed cell voltages\n");
+      }
+    }
 
+    // Handle connect/disconnect transitions
+    if (!gDeviceConnected && gOldDeviceConnected) {
+      logf("Client disconnected; restarting advertising.\n");
+      vTaskDelay(period500ms);
+      gServer->startAdvertising();
+      gOldDeviceConnected = gDeviceConnected;
+    }
+    if (gDeviceConnected && !gOldDeviceConnected) {
+      logf("Client connected.\n");
+      notifyCellVoltages();
+      lastPush = now;
+      gOldDeviceConnected = gDeviceConnected;
+    }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    // keep the loop light
+    vTaskDelay(period10ms);
+  }
+}
 
 
 
